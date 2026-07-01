@@ -53,6 +53,35 @@ int SafepointTable::find_return_pc(int pc_offset) {
   UNREACHABLE();
 }
 
+#if defined(__CHERI_PURE_CAPABILITY__)
+void SafepointTable::InstallTrampolineSentries(Address code_start,
+                                               Address old_code_start) {
+  if (!has_deopt_data()) return;
+  DCHECK(uses_sentries());
+  for (int i = 0; i < length(); ++i) {
+    Address field_address = GetTrampolineSentryAddress(i);
+    uintptr_t field = Memory<uintptr_t>(field_address);
+
+    uintptr_t addr = V8_CHERI_ADDR_GET(field);
+    if (static_cast<intptr_t>(addr) == SafepointEntry::kNoTrampolinePC) {
+      continue;
+    }
+    intptr_t trampoline_pc =
+        static_cast<intptr_t>((addr & ~1) - old_code_start);
+    DCHECK_GE(trampoline_pc, 0);
+
+    Address trampoline_sentry = code_start + trampoline_pc;
+#ifdef __aarch64__
+    trampoline_sentry |= 1;  // C64 LSB
+#endif
+    trampoline_sentry = V8_CHERI_TO_SENTRY(trampoline_sentry);
+    DCHECK(V8_CHERI_TAG_GET(trampoline_sentry));
+    DCHECK(V8_CHERI_SEALED(trampoline_sentry));
+    Memory<Address>(field_address) = trampoline_sentry;
+  }
+}
+#endif  // __CHERI_PURE_CAPABILITY__
+
 SafepointEntry SafepointTable::FindEntry(Address pc) const {
   int pc_offset = static_cast<int>(pc - instruction_start_);
 
@@ -179,6 +208,11 @@ void SafepointTableBuilder::Emit(Assembler* assembler, int tagged_slots_size) {
   assembler->RecordComment(";;; Safepoint table.");
   set_safepoint_table_offset(assembler->pc_offset());
 
+  // On CHERI the trampoline is stored as a sentry after the entries rather than
+  // as a packed pc-sized field; the single flag drives every layout decision
+  // below (and is recorded in the entry configuration for the reader).
+  const bool use_sentry = V8_TARGET_CHERI_BOOL;
+
   // Compute the required sizes of the fields.
   int used_register_indexes = 0;
   static_assert(SafepointEntry::kNoTrampolinePC == -1);
@@ -187,7 +221,9 @@ void SafepointTableBuilder::Emit(Assembler* assembler, int tagged_slots_size) {
   int max_deopt_index = SafepointEntry::kNoDeoptIndex;
   for (const EntryBuilder& entry : entries_) {
     used_register_indexes |= entry.register_indexes;
-    max_pc = std::max(max_pc, std::max(entry.pc, entry.trampoline));
+    max_pc = std::max(max_pc, entry.pc);
+    // Packed trampolines widen pc_size; sentry trampolines do not.
+    if (!use_sentry) max_pc = std::max(max_pc, entry.trampoline);
     max_deopt_index = std::max(max_deopt_index, entry.deopt_index);
   }
 
@@ -224,6 +260,7 @@ void SafepointTableBuilder::Emit(Assembler* assembler, int tagged_slots_size) {
       SafepointTable::RegisterIndexesSizeField::encode(register_indexes_size) |
       SafepointTable::PcSizeField::encode(pc_size) |
       SafepointTable::DeoptIndexSizeField::encode(deopt_index_size) |
+      SafepointTable::UseSentryField::encode(use_sentry && has_deopt_data) |
       SafepointTable::TaggedSlotsBytesField::encode(tagged_slots_bytes);
 
   // Emit the table header.
@@ -248,7 +285,8 @@ void SafepointTableBuilder::Emit(Assembler* assembler, int tagged_slots_size) {
       static_assert(SafepointEntry::kNoDeoptIndex == -1);
       static_assert(SafepointEntry::kNoTrampolinePC == -1);
       emit_bytes(entry.deopt_index + 1, deopt_index_size);
-      emit_bytes(entry.trampoline + 1, pc_size);
+      // With sentries the trampoline is emitted into the sentry region below.
+      if (!use_sentry) emit_bytes(entry.trampoline + 1, pc_size);
     }
     emit_bytes(entry.register_indexes, register_indexes_size);
   }
@@ -274,6 +312,17 @@ void SafepointTableBuilder::Emit(Assembler* assembler, int tagged_slots_size) {
 
     // Emit the bitmap for the current entry.
     for (uint8_t byte : bits) assembler->db(byte);
+  }
+
+  // Emit the trampoline sentry as raw offsets;
+  // InstallSentries seals them later.
+  if (use_sentry && has_deopt_data) {
+    assembler->DataAlign(kSystemPointerSize);
+    for (const EntryBuilder& entry : entries_) {
+      static_assert(SafepointEntry::kNoTrampolinePC == -1);
+      assembler->dp(
+          static_cast<uintptr_t>(static_cast<intptr_t>(entry.trampoline)));
+    }
   }
 }
 

@@ -4091,6 +4091,13 @@ MaybeHandle<Code> PipelineImpl::FinalizeCode(bool retire_broker) {
         << "Finished compiling method " << info()->GetDebugName().get()
         << " using TurboFan" << std::endl;
   }
+
+#if defined(__CHERI_PURE_CAPABILITY__)
+  if (code->use_sentry_cfi()) {
+    code->InstallSentries(isolate());
+  }
+#endif
+
   data->EndPhaseKind();
   return code;
 }

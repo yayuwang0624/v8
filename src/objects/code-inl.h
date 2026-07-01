@@ -33,6 +33,9 @@ Code GcSafeCode::UnsafeCastToCode() const {
   ReturnType GcSafeCode::Name() const { return UnsafeCastToCode().Name(); }
 GCSAFE_CODE_FWD_ACCESSOR(Address, instruction_start)
 GCSAFE_CODE_FWD_ACCESSOR(Address, instruction_end)
+#if defined(__CHERI_PURE_CAPABILITY__)
+GCSAFE_CODE_FWD_ACCESSOR(Address, instruction_sentry)
+#endif
 GCSAFE_CODE_FWD_ACCESSOR(bool, is_builtin)
 GCSAFE_CODE_FWD_ACCESSOR(Builtin, builtin_id)
 GCSAFE_CODE_FWD_ACCESSOR(CodeKind, kind)
@@ -139,6 +142,7 @@ Address Code::metadata_start() const {
     static_assert(InstructionStream::kOnHeapBodyIsContiguous);
 #ifdef __CHERI_PURE_CAPABILITY__
     Address start = instruction_start();
+    // NOTE(cheri): We cannot re-deriving Turbofanned instruction from the PCC.
     // FIXME(ds815): We might not be re-deriving this from the PCC.
     if (V8_CHERI_SEALED(start)) {
       Address pcc = reinterpret_cast<Address>(V8_CHERI_PCC);
@@ -172,6 +176,14 @@ Address Code::InstructionStart(Isolate* isolate, Address pc) const {
 Address Code::InstructionEnd(Isolate* isolate, Address pc) const {
   return InstructionStart(isolate, pc) + instruction_size();
 }
+
+#if defined(__CHERI_PURE_CAPABILITY__)
+Address Code::InstructionSentry(Isolate* isolate, Address pc) const {
+  if (V8_LIKELY(has_instruction_stream())) return instruction_sentry();
+  return EmbeddedData::FromBlobForPc(isolate, pc)
+      .InstructionStartOf(builtin_id());
+}
+#endif  // __CHERI_PURE_CAPABILITY__
 
 int Code::GetOffsetFromInstructionStart(Isolate* isolate, Address pc) const {
 #if defined(__CHERI_PURE_CAPABILITY__) && defined(__aarch64__)
@@ -475,6 +487,8 @@ int Code::unwinding_info_size() const {
 
 bool Code::has_unwinding_info() const { return unwinding_info_size() > 0; }
 
+bool Code::use_sentry_cfi() const { return CodeKindUsesSentryCFI(kind()); }
+
 // static
 Code Code::FromTargetAddress(Address address) {
   return InstructionStream::FromTargetAddress(address).code(kAcquireLoad);
@@ -624,11 +638,45 @@ void Code::set_instruction_start(Isolate* isolate, Address value) {
 #ifdef __CHERI_PURE_CAPABILITY__
   if (COMPRESS_POINTERS_BOOL) {
     WriteFieldAlignUp<Address>(kInstructionStartOffset, value);
+    // TODO(cheri): set sentry for compressed pointers
     return;
   }
+  set_instruction_sentry(isolate, value);
 #endif  // __CHERI_PURE_CAPABILITY__
   WriteField<Address>(kInstructionStartOffset, value);
 }
+
+#if defined(__CHERI_PURE_CAPABILITY__)
+DEF_GETTER(Code, instruction_sentry, Address) {
+  if (COMPRESS_POINTERS_BOOL) {
+    return ReadFieldAlignUp<Address>(kInstructionSentryOffset);
+  }
+  return ReadField<Address>(kInstructionSentryOffset);
+}
+
+DEF_GETTER(Code, osr_sentry, Address) {
+  if (COMPRESS_POINTERS_BOOL) {
+    return ReadFieldAlignUp<Address>(kOsrSentryOffset);
+  }
+  return ReadField<Address>(kOsrSentryOffset);
+}
+
+void Code::set_instruction_sentry(Isolate* isolate, Address value) {
+  if (COMPRESS_POINTERS_BOOL) {
+    WriteFieldAlignUp<Address>(kInstructionSentryOffset, value);
+    return;
+  }
+  WriteField<Address>(kInstructionSentryOffset, value);
+}
+
+void Code::set_osr_sentry(Isolate* isolate, Address value) {
+  if (COMPRESS_POINTERS_BOOL) {
+    WriteFieldAlignUp<Address>(kOsrSentryOffset, value);
+    return;
+  }
+  WriteField<Address>(kOsrSentryOffset, value);
+}
+#endif  // __CHERI_PURE_CAPABILITY__
 
 void Code::SetInstructionStreamAndInstructionStart(Isolate* isolate_for_sandbox,
                                                    InstructionStream code,
@@ -651,6 +699,14 @@ void Code::SetInstructionStartForSerialization(Isolate* isolate,
 void Code::UpdateInstructionStart(Isolate* isolate_for_sandbox,
                                   InstructionStream istream) {
   DCHECK_EQ(raw_instruction_stream(), istream);
+#if defined(__CHERI_PURE_CAPABILITY__)
+  if (use_sentry_cfi()) {
+    Address old_instruction_start = instruction_start();
+    set_instruction_start(isolate_for_sandbox, istream.instruction_start());
+    InstallSentries(isolate_for_sandbox, old_instruction_start);
+    return;
+  }
+#endif  // __CHERI_PURE_CAPABILITY__
   set_instruction_start(isolate_for_sandbox, istream.instruction_start());
 }
 

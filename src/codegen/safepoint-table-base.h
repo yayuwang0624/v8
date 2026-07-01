@@ -19,8 +19,12 @@ class SafepointEntryBase {
 
   SafepointEntryBase() = default;
 
-  SafepointEntryBase(int pc, int deopt_index, int trampoline_pc)
-      : pc_(pc), deopt_index_(deopt_index), trampoline_pc_(trampoline_pc) {
+  SafepointEntryBase(int pc, int deopt_index, int trampoline_pc,
+                     uintptr_t trampoline_sentry = 0)
+      : pc_(pc),
+        deopt_index_(deopt_index),
+        trampoline_pc_(trampoline_pc),
+        trampoline_sentry_(trampoline_sentry) {
     DCHECK(is_initialized());
   }
 
@@ -32,6 +36,8 @@ class SafepointEntryBase {
   }
 
   int trampoline_pc() const { return trampoline_pc_; }
+
+  uintptr_t trampoline_sentry() const { return trampoline_sentry_; }
 
   bool has_deoptimization_index() const {
     return deopt_index_ != kNoDeoptIndex;
@@ -54,6 +60,8 @@ class SafepointEntryBase {
   int pc_ = 0;
   int deopt_index_ = kNoDeoptIndex;
   int trampoline_pc_ = kNoTrampolinePC;
+  // Sealed deopt trampoline; only populated on CHERI, otherwise stays 0.
+  uintptr_t trampoline_sentry_ = 0;
 };
 
 class SafepointTableBuilderBase {

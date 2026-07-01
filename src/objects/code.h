@@ -79,6 +79,11 @@ class Code : public HeapObject {
   DECL_PRIMITIVE_ACCESSORS(instruction_size, int)
   inline Address instruction_end() const;
 
+#if defined(__CHERI_PURE_CAPABILITY__)
+  DECL_GETTER(instruction_sentry, Address)
+  DECL_GETTER(osr_sentry, Address)
+#endif
+
   inline void SetInstructionStreamAndInstructionStart(
       Isolate* isolate_for_sandbox, InstructionStream code,
       WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
@@ -197,6 +202,8 @@ class Code : public HeapObject {
   inline int unwinding_info_size() const;
   inline bool has_unwinding_info() const;
 
+  inline bool use_sentry_cfi() const;
+
   inline uint8_t* relocation_start() const;
   inline uint8_t* relocation_end() const;
   inline int relocation_size() const;
@@ -233,6 +240,9 @@ class Code : public HeapObject {
   // TODO(11527): remove these versions once the full solution is ready.
   inline Address InstructionStart(Isolate* isolate, Address pc) const;
   inline Address InstructionEnd(Isolate* isolate, Address pc) const;
+#if defined(__CHERI_PURE_CAPABILITY__)
+  inline Address InstructionSentry(Isolate* isolate, Address pc) const;
+#endif
   inline bool contains(Isolate* isolate, Address pc) const;
   inline int GetOffsetFromInstructionStart(Isolate* isolate, Address pc) const;
   // Support for short builtin calls END.
@@ -259,6 +269,12 @@ class Code : public HeapObject {
 
   // Migrate code from desc without flushing the instruction cache.
   void CopyFromNoFlush(ByteArray reloc_info, Heap* heap, const CodeDesc& desc);
+
+#if defined(__CHERI_PURE_CAPABILITY__)
+  void InstallSentries(Isolate* isolate,
+                       Address old_instruction_start = kNullAddress);
+#endif  // __CHERI_PURE_CAPABILITY__
+
   void RelocateFromDesc(Heap* heap, const CodeDesc& desc);
 
   bool IsIsolateIndependent(Isolate* isolate);
@@ -319,12 +335,14 @@ class Code : public HeapObject {
   V(kEndOfStrongFieldsOffset, 0)                                              \
   /* Untagged data not directly visited by GC starts here. */                 \
   V(kInstructionStartOffset, kSystemPointerSize + 3 * kTaggedSize)            \
+  V(kInstructionSentryOffset, kSystemPointerSize)                             \
   /* The serializer needs to copy bytes starting from here verbatim. */       \
   V(kFlagsOffset, kUInt32Size)                                                \
   V(kInstructionSizeOffset, kIntSize)                                         \
   V(kMetadataSizeOffset, kIntSize)                                            \
   /* TODO(jgruber): TF-specific fields could be merged with builtin_id. */    \
   V(kInlinedBytecodeSizeOffset, kIntSize)                                     \
+  V(kOsrSentryOffset, kSystemPointerSize)                                     \
   V(kOsrOffsetOffset, kInt32Size)                                             \
   V(kHandlerTableOffsetOffset, kIntSize)                                      \
   V(kUnwindingInfoOffsetOffset, kInt32Size)                                   \
@@ -347,12 +365,14 @@ class Code : public HeapObject {
   V(kEndOfStrongFieldsOffset, 0)                                              \
   /* Untagged data not directly visited by GC starts here. */                 \
   V(kInstructionStartOffset, kSystemPointerSize)                              \
+  V(kInstructionSentryOffset, kSystemPointerSize)                             \
   /* The serializer needs to copy bytes starting from here verbatim. */       \
   V(kFlagsOffset, kUInt32Size)                                                \
   V(kInstructionSizeOffset, kIntSize)                                         \
   V(kMetadataSizeOffset, kIntSize)                                            \
   /* TODO(jgruber): TF-specific fields could be merged with builtin_id. */    \
   V(kInlinedBytecodeSizeOffset, kIntSize)                                     \
+  V(kOsrSentryOffset, kSystemPointerSize)                                     \
   V(kOsrOffsetOffset, kInt32Size)                                             \
   V(kHandlerTableOffsetOffset, kIntSize)                                      \
   V(kUnwindingInfoOffsetOffset, kInt32Size)                                   \
@@ -435,6 +455,10 @@ class Code : public HeapObject {
  private:
   inline void init_instruction_start(Isolate* isolate, Address initial_value);
   inline void set_instruction_start(Isolate* isolate, Address value);
+#if defined(__CHERI_PURE_CAPABILITY__)
+  inline void set_instruction_sentry(Isolate* isolate, Address value);
+  inline void set_osr_sentry(Isolate* isolate, Address value);
+#endif
 
   // TODO(jgruber): These field names are incomplete, we've squashed in more
   // overloaded contents in the meantime. Update the field names.
@@ -491,6 +515,9 @@ class GcSafeCode : public HeapObject {
   // Safe accessors (these just forward to Code methods).
   inline Address instruction_start() const;
   inline Address instruction_end() const;
+#if defined(__CHERI_PURE_CAPABILITY__)
+  inline Address instruction_sentry() const;
+#endif
   inline bool is_builtin() const;
   inline Builtin builtin_id() const;
   inline CodeKind kind() const;

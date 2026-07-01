@@ -425,9 +425,20 @@ void CodeGenerator::AssembleCode() {
   // Emit the exception handler table.
   if (!handlers_.empty()) {
     handler_table_offset_ = HandlerTable::EmitReturnTableStart(masm());
-    for (size_t i = 0; i < handlers_.size(); ++i) {
-      HandlerTable::EmitReturnEntry(masm(), handlers_[i].pc_offset,
-                                    handlers_[i].handler->pos());
+    if (CodeKindUsesSentryCFI(code_kind())) {
+      for (size_t i = 0; i < handlers_.size(); ++i) {
+        masm()->dd(handlers_[i].pc_offset);
+      }
+      masm()->Align(kSystemPointerSize);
+      for (size_t i = 0; i < handlers_.size(); ++i) {
+        HandlerTable::EmitReturnSentry(
+            masm(), static_cast<uintptr_t>(handlers_[i].handler->pos()));
+      }
+    } else {
+      for (size_t i = 0; i < handlers_.size(); ++i) {
+        HandlerTable::EmitReturnEntry(masm(), handlers_[i].pc_offset,
+                                      handlers_[i].handler->pos());
+      }
     }
   }
 

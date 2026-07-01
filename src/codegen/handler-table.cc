@@ -21,7 +21,8 @@ namespace internal {
 
 HandlerTable::HandlerTable(Code code)
     : HandlerTable(code.handler_table_address(), code.handler_table_size(),
-                   kReturnAddressBasedEncoding) {}
+                   code.use_sentry_cfi() ? kReturnAddressBasedEncodingWithSentry
+                                         : kReturnAddressBasedEncoding) {}
 
 #if V8_ENABLE_WEBASSEMBLY
 HandlerTable::HandlerTable(const wasm::WasmCode* code)
@@ -43,12 +44,28 @@ HandlerTable::HandlerTable(Address handler_table, int handler_table_size,
 #ifdef DEBUG
       mode_(encoding_mode),
 #endif
+      use_sentry_(encoding_mode == kReturnAddressBasedEncodingWithSentry),
       raw_encoded_data_(handler_table) {
   // Check padding.
   static_assert(4 < kReturnEntrySize * sizeof(int32_t), "allowed padding");
-  // For return address encoding, maximum padding is 4; otherwise, there should
-  // be no padding.
-  DCHECK_GE(kReturnAddressBasedEncoding == encoding_mode ? 4 : 0,
+
+  // For return address encoding, maximum padding is 4;
+  // for return sentry encoding, maximum padding is 4 (MetadataAlignment),
+  // plus kSystemPointerSize (capability alignment);
+  // otherwise, there should be no padding.
+  int max_padding;
+  switch (encoding_mode) {
+    case kRangeBasedEncoding:
+      max_padding = 0;
+      break;
+    case kReturnAddressBasedEncoding:
+      max_padding = 4;
+      break;
+    case kReturnAddressBasedEncodingWithSentry:
+      max_padding = 4 + kSystemPointerSize;
+      break;
+  }
+  DCHECK_GE(max_padding,
             handler_table_size %
                 (EntrySizeFromMode(encoding_mode) * sizeof(int32_t)));
 }
@@ -58,6 +75,8 @@ int HandlerTable::EntrySizeFromMode(EncodingMode mode) {
   switch (mode) {
     case kReturnAddressBasedEncoding:
       return kReturnEntrySize;
+    case kReturnAddressBasedEncodingWithSentry:
+      return kReturnEntrySizeWithSentry + kReturnSentrySize;
     case kRangeBasedEncoding:
       return kRangeEntrySize;
   }
@@ -103,9 +122,9 @@ HandlerTable::CatchPrediction HandlerTable::GetRangePrediction(
 }
 
 int HandlerTable::GetReturnOffset(int index) const {
-  DCHECK_EQ(kReturnAddressBasedEncoding, mode_);
+  DCHECK_NE(kRangeBasedEncoding, mode_);
   DCHECK_LT(index, NumberOfReturnEntries());
-  int offset = index * kReturnEntrySize + kReturnOffsetIndex;
+  int offset = index * return_entry_stride() + kReturnOffsetIndex;
   return Memory<int32_t>(raw_encoded_data_ + offset * sizeof(int32_t));
 }
 
@@ -116,6 +135,46 @@ int HandlerTable::GetReturnHandler(int index) const {
   return HandlerOffsetField::decode(
       Memory<int32_t>(raw_encoded_data_ + offset * sizeof(int32_t)));
 }
+
+Address HandlerTable::GetReturnSentryAddress(int index) const {
+  DCHECK(use_sentry_);
+  DCHECK_LT(index, NumberOfReturnEntries());
+  Address sentry_table_start =
+      raw_encoded_data_ +
+      RoundUp(number_of_entries_ * return_entry_stride(), 4) * sizeof(int32_t);
+  return sentry_table_start + index * kReturnSentrySize * sizeof(int32_t);
+}
+
+uintptr_t HandlerTable::GetReturnSentry(int index) const {
+  DCHECK(use_sentry_);
+  DCHECK_LT(index, NumberOfReturnEntries());
+  return Memory<uintptr_t>(GetReturnSentryAddress(index));
+}
+
+#if defined(__CHERI_PURE_CAPABILITY__)
+void HandlerTable::InstallReturnSentries(Address code_start,
+                                         Address old_code_start) {
+  DCHECK(use_sentry_);
+  for (int i = 0; i < NumberOfReturnEntries(); ++i) {
+    Address field_address = GetReturnSentryAddress(i);
+    uintptr_t field = Memory<uintptr_t>(field_address);
+
+    uintptr_t addr = V8_CHERI_ADDR_GET(field);
+    intptr_t handler_offset =
+        static_cast<intptr_t>((addr & ~1) - old_code_start);
+    DCHECK_GE(handler_offset, 0);
+
+    Address return_sentry = code_start + handler_offset;
+#ifdef __aarch64__
+    return_sentry |= 1;  // C64 LSB
+#endif
+    return_sentry = V8_CHERI_TO_SENTRY(return_sentry);
+    DCHECK(V8_CHERI_TAG_GET(return_sentry));
+    DCHECK(V8_CHERI_SEALED(return_sentry));
+    Memory<Address>(field_address) = return_sentry;
+  }
+}
+#endif  // __CHERI_PURE_CAPABILITY__
 
 void HandlerTable::SetRangeStart(int index, int value) {
   int offset = index * kRangeEntrySize + kRangeStartIndex;
@@ -159,13 +218,17 @@ void HandlerTable::EmitReturnEntry(Assembler* masm, int offset, int handler) {
   masm->dd(HandlerOffsetField::encode(handler));
 }
 
+void HandlerTable::EmitReturnSentry(Assembler* masm, uintptr_t sentry) {
+  masm->dp(sentry);
+}
+
 int HandlerTable::NumberOfRangeEntries() const {
   DCHECK_EQ(kRangeBasedEncoding, mode_);
   return number_of_entries_;
 }
 
 int HandlerTable::NumberOfReturnEntries() const {
-  DCHECK_EQ(kReturnAddressBasedEncoding, mode_);
+  DCHECK_NE(kRangeBasedEncoding, mode_);
   return number_of_entries_;
 }
 
@@ -199,7 +262,7 @@ int HandlerTable::LookupRange(int pc_offset, int* data_out,
   return innermost_handler;
 }
 
-int HandlerTable::LookupReturn(int pc_offset) {
+int HandlerTable::LookupReturnIndex(int pc_offset) {
   // We only implement the methods needed by the standard libraries we care
   // about. This is not technically a full random access iterator by the spec.
   struct Iterator : base::iterator<std::random_access_iterator_tag, int> {
@@ -233,7 +296,18 @@ int HandlerTable::LookupReturn(int pc_offset) {
   SLOW_DCHECK(std::is_sorted(begin, end));  // Must be sorted.
   Iterator result = std::lower_bound(begin, end, pc_offset);
   bool exact_match = result != end && *result == pc_offset;
-  return exact_match ? GetReturnHandler(result.index) : -1;
+  return exact_match ? result.index : -1;
+}
+
+int HandlerTable::LookupReturn(int pc_offset) {
+  int index = LookupReturnIndex(pc_offset);
+  if (index < 0) return -1;
+  return use_sentry_ ? 0 : GetReturnHandler(index);
+}
+
+uintptr_t HandlerTable::LookupReturnSentry(int pc_offset) {
+  int index = LookupReturnIndex(pc_offset);
+  return index < 0 ? 0 : GetReturnSentry(index);
 }
 
 #ifdef ENABLE_DISASSEMBLER
@@ -256,9 +330,13 @@ void HandlerTable::HandlerTableReturnPrint(std::ostream& os) {
   os << "  offset   handler\n";
   for (int i = 0; i < NumberOfReturnEntries(); ++i) {
     int pc_offset = GetReturnOffset(i);
-    int handler_offset = GetReturnHandler(i);
-    os << std::hex << "    " << std::setw(4) << pc_offset << "  ->  "
-       << std::setw(4) << handler_offset << std::dec << "\n";
+    os << std::hex << "    " << std::setw(4) << pc_offset << "  ->  ";
+    if (use_sentry_) {
+      os << reinterpret_cast<void*>(GetReturnSentry(i));
+    } else {
+      os << std::setw(4) << GetReturnHandler(i);
+    }
+    os << std::dec << "\n";
   }
 }
 

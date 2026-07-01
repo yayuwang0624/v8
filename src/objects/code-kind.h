@@ -85,6 +85,11 @@ inline constexpr bool CodeKindCanDeoptimize(CodeKind kind) {
   return CodeKindIsOptimizedJSFunction(kind);
 }
 
+inline constexpr bool CodeKindUsesSentryCFI(CodeKind kind) {
+  // TODO(cheri): Use sentry for other code kinds
+  return V8_TARGET_CHERI_BOOL && kind == CodeKind::TURBOFAN;
+}
+
 inline constexpr bool CodeKindCanOSR(CodeKind kind) {
   return kind == CodeKind::TURBOFAN || kind == CodeKind::MAGLEV;
 }

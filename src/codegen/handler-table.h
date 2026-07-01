@@ -52,7 +52,11 @@ class V8_EXPORT_PRIVATE HandlerTable {
                            // be kept alive on the Isolate though.
   };
 
-  enum EncodingMode { kRangeBasedEncoding, kReturnAddressBasedEncoding };
+  enum EncodingMode {
+    kRangeBasedEncoding,
+    kReturnAddressBasedEncoding,
+    kReturnAddressBasedEncodingWithSentry
+  };
 
   // Constructors for the various encodings.
   explicit HandlerTable(InstructionStream code);
@@ -84,6 +88,8 @@ class V8_EXPORT_PRIVATE HandlerTable {
   static int EmitReturnTableStart(Assembler* masm);
   static void EmitReturnEntry(Assembler* masm, int offset, int handler);
 
+  static void EmitReturnSentry(Assembler* masm, uintptr_t sentry);
+
   // Lookup handler in a table based on ranges. The {pc_offset} is an offset to
   // the start of the potentially throwing instruction (using return addresses
   // for this value would be invalid).
@@ -91,6 +97,13 @@ class V8_EXPORT_PRIVATE HandlerTable {
 
   // Lookup handler in a table based on return addresses.
   int LookupReturn(int pc_offset);
+
+  Address GetReturnSentryAddress(int index) const;
+  uintptr_t LookupReturnSentry(int pc_offset);
+
+#if defined(__CHERI_PURE_CAPABILITY__)
+  void InstallReturnSentries(Address code_start, Address old_code_start);
+#endif  // __CHERI_PURE_CAPABILITY__
 
   // Returns the number of entries in the table.
   int NumberOfRangeEntries() const;
@@ -107,19 +120,23 @@ class V8_EXPORT_PRIVATE HandlerTable {
 
   // Gets entry size based on mode.
   static int EntrySizeFromMode(EncodingMode mode);
+  uintptr_t GetReturnSentry(int index) const;
 
   // Getters for handler table based on return addresses.
   int GetReturnOffset(int index) const;
   int GetReturnHandler(int index) const;
 
+  int LookupReturnIndex(int pc_offset);
+
   // Number of entries in the loaded handler table.
   const int number_of_entries_;
 
+  // The encoding mode of the table.
 #ifdef DEBUG
-  // The encoding mode of the table. Mostly useful for debugging to check that
-  // used accessors and constructors fit together.
   const EncodingMode mode_;
 #endif
+
+  const bool use_sentry_;
 
   // Direct pointer into the encoded data. This pointer potentially points into
   // objects on the GC heap (either {ByteArray} or {InstructionStream}) and
@@ -138,6 +155,12 @@ class V8_EXPORT_PRIVATE HandlerTable {
   static const int kReturnOffsetIndex = 0;
   static const int kReturnHandlerIndex = 1;
   static const int kReturnEntrySize = 2;
+  static const int kReturnSentrySize = kSystemPointerSize / kInt32Size;
+  static const int kReturnEntrySizeWithSentry = 1;
+
+  int return_entry_stride() const {
+    return use_sentry_ ? kReturnEntrySizeWithSentry : kReturnEntrySize;
+  }
 
   // Encoding of the {handler} field.
   using HandlerPredictionField = base::BitField<CatchPrediction, 0, 3>;

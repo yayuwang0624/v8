@@ -27,8 +27,9 @@ class SafepointEntry : public SafepointEntryBase {
   SafepointEntry() = default;
 
   SafepointEntry(int pc, int deopt_index, uint32_t tagged_register_indexes,
-                 base::Vector<uint8_t> tagged_slots, int trampoline_pc)
-      : SafepointEntryBase(pc, deopt_index, trampoline_pc),
+                 base::Vector<uint8_t> tagged_slots, int trampoline_pc,
+                 uintptr_t trampoline_sentry = 0)
+      : SafepointEntryBase(pc, deopt_index, trampoline_pc, trampoline_sentry),
         tagged_register_indexes_(tagged_register_indexes),
         tagged_slots_(tagged_slots) {
     DCHECK(is_initialized());
@@ -74,10 +75,25 @@ class SafepointTable {
   int length() const { return length_; }
 
   int byte_size() const {
-    return kHeaderSize + length_ * (entry_size() + tagged_slots_bytes());
+    int base = kHeaderSize + length_ * (entry_size() + tagged_slots_bytes());
+    if (uses_sentries()) {
+      base = RoundUp(base, kSystemPointerSize) +
+             length_ * trampoline_sentry_size();
+    }
+    return base;
   }
 
   int find_return_pc(int pc_offset);
+
+  Address GetTrampolineSentryAddress(int index) const {
+    DCHECK(uses_sentries());
+    DCHECK_GT(length_, index);
+    Address sentry_table_base =
+        RoundUp(safepoint_table_address_ + kHeaderSize +
+                    length_ * (entry_size() + tagged_slots_bytes()),
+                kSystemPointerSize);
+    return sentry_table_base + index * trampoline_sentry_size();
+  }
 
   SafepointEntry GetEntry(int index) const {
     DCHECK_GT(length_, index);
@@ -87,14 +103,32 @@ class SafepointTable {
     int pc = read_bytes(&entry_ptr, pc_size());
     int deopt_index = SafepointEntry::kNoDeoptIndex;
     int trampoline_pc = SafepointEntry::kNoTrampolinePC;
+    uintptr_t trampoline_sentry = 0;
     if (has_deopt_data()) {
       static_assert(SafepointEntry::kNoDeoptIndex == -1);
       static_assert(SafepointEntry::kNoTrampolinePC == -1);
       // `-1` to restore the original value, see also
       // SafepointTableBuilder::Emit.
       deopt_index = read_bytes(&entry_ptr, deopt_index_size()) - 1;
-      trampoline_pc = read_bytes(&entry_ptr, pc_size()) - 1;
       DCHECK(deopt_index >= 0 || deopt_index == SafepointEntry::kNoDeoptIndex);
+      if (uses_sentries()) {
+        uintptr_t trampoline_field =
+            *reinterpret_cast<uintptr_t*>(GetTrampolineSentryAddress(index));
+        if (V8_CHERI_TAG_GET(trampoline_field)) {
+          trampoline_sentry = trampoline_field;
+          uintptr_t addr = V8_CHERI_ADDR_GET(trampoline_field);
+#ifdef __aarch64__
+          addr &= ~1;  // strip the C64 LSB
+#endif
+          trampoline_pc =
+              static_cast<int>(addr - V8_CHERI_ADDR_GET(instruction_start_));
+        } else {
+          trampoline_pc =
+              static_cast<int>(static_cast<intptr_t>(trampoline_field));
+        }
+      } else {
+        trampoline_pc = read_bytes(&entry_ptr, pc_size()) - 1;
+      }
       DCHECK(trampoline_pc >= 0 ||
              trampoline_pc == SafepointEntry::kNoTrampolinePC);
     }
@@ -110,8 +144,12 @@ class SafepointTable {
         tagged_slots_bytes());
 
     return SafepointEntry(pc, deopt_index, tagged_register_indexes,
-                          tagged_slots, trampoline_pc);
+                          tagged_slots, trampoline_pc, trampoline_sentry);
   }
+
+#if defined(__CHERI_PURE_CAPABILITY__)
+  void InstallTrampolineSentries(Address code_start, Address old_code_start);
+#endif  // __CHERI_PURE_CAPABILITY__
 
   // Returns the entry for the given pc.
   SafepointEntry FindEntry(Address pc) const;
@@ -132,15 +170,23 @@ class SafepointTable {
   using RegisterIndexesSizeField = HasDeoptDataField::Next<int, 3>;
   using PcSizeField = RegisterIndexesSizeField::Next<int, 3>;
   using DeoptIndexSizeField = PcSizeField::Next<int, 3>;
-  // In 22 bits, we can encode up to 4M bytes, corresponding to 32M frame slots,
-  // which is 128MB on 32-bit and 256MB on 64-bit systems. The stack size is
+  // Set when the trampolines are stored as CHERI sentries rather than packed
+  // pc-offsets; the trampoline sentry region follows the entries.
+  using UseSentryField = DeoptIndexSizeField::Next<bool, 1>;
+  // In 21 bits, we can encode up to 2M bytes, corresponding to 16M frame slots,
+  // which is 64MB on 32-bit and 128MB on 64-bit systems. The stack size is
   // limited to a bit below 1MB anyway (see v8_flags.stack_size).
-  using TaggedSlotsBytesField = DeoptIndexSizeField::Next<int, 22>;
+  using TaggedSlotsBytesField = UseSentryField::Next<int, 21>;
 
   SafepointTable(Address instruction_start, Address safepoint_table_address);
 
   int entry_size() const {
-    int deopt_data_size = has_deopt_data() ? pc_size() + deopt_index_size() : 0;
+    int deopt_data_size = 0;
+    if (has_deopt_data()) {
+      deopt_data_size = deopt_index_size();
+      // With sentries the trampoline is in the sentry region, not packed here.
+      if (!uses_sentries()) deopt_data_size += pc_size();
+    }
     return pc_size() + deopt_data_size + register_indexes_size();
   }
 
@@ -150,7 +196,13 @@ class SafepointTable {
   bool has_deopt_data() const {
     return HasDeoptDataField::decode(entry_configuration_);
   }
+  // Whether the trampolines are stored as sentries (implies has_deopt_data()).
+  bool uses_sentries() const {
+    return UseSentryField::decode(entry_configuration_);
+  }
   int pc_size() const { return PcSizeField::decode(entry_configuration_); }
+
+  int trampoline_sentry_size() const { return kSystemPointerSize; }
   int deopt_index_size() const {
     return DeoptIndexSizeField::decode(entry_configuration_);
   }
