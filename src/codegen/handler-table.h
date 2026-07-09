@@ -6,6 +6,7 @@
 #define V8_CODEGEN_HANDLER_TABLE_H_
 
 #include "src/base/bit-field.h"
+#include "src/base/iterator.h"
 #include "src/common/assert-scope.h"
 #include "src/common/globals.h"
 
@@ -115,6 +116,41 @@ class V8_EXPORT_PRIVATE HandlerTable {
 #endif
 
  private:
+  // We only implement the methods needed by the standard libraries we care
+  // about. This is not technically a full random access iterator by the spec.
+  struct ReturnOffsetIterator
+      : base::iterator<std::random_access_iterator_tag, int> {
+    ReturnOffsetIterator(HandlerTable* tbl, int idx) : table(tbl), index(idx) {}
+    value_type operator*() const { return table->GetReturnOffset(index); }
+    bool operator!=(const ReturnOffsetIterator& other) const {
+      return !(*this == other);
+    }
+    bool operator==(const ReturnOffsetIterator& other) const {
+      return index == other.index;
+    }
+    // GLIBCXX_DEBUG checks uses the <= comparator.
+    bool operator<=(const ReturnOffsetIterator& other) {
+      return index <= other.index;
+    }
+    ReturnOffsetIterator& operator++() {
+      index++;
+      return *this;
+    }
+    ReturnOffsetIterator& operator--() {
+      index--;
+      return *this;
+    }
+    ReturnOffsetIterator& operator+=(difference_type offset) {
+      index += offset;
+      return *this;
+    }
+    difference_type operator-(const ReturnOffsetIterator& other) const {
+      return index - other.index;
+    }
+    HandlerTable* table;
+    int index;
+  };
+
   // Getters for handler table based on ranges.
   CatchPrediction GetRangePrediction(int index) const;
 
